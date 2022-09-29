@@ -82,59 +82,54 @@ func (r *runner) concurrent(rate int) (failed bool) {
 	}
 
 	queue := make(chan int, rate)
+	pickles := make([]*messages.Pickle, 0, len(r.features))
+
 	for _, ft := range r.features {
-		pickles := make([]*messages.Pickle, len(ft.Pickles))
-		if r.randomSeed != 0 {
-			r := rand.New(rand.NewSource(r.randomSeed))
-			perm := r.Perm(len(ft.Pickles))
-			for i, v := range perm {
-				pickles[v] = ft.Pickles[i]
+		pickles = append(pickles, ft.Pickles...)
+		r.fmt.Feature(ft.GherkinDocument, ft.Uri, ft.Content)
+	}
+
+	if r.randomSeed != 0 {
+		rand.Seed(r.randomSeed)
+		rand.Shuffle(len(pickles), func(i, j int) { pickles[i], pickles[j] = pickles[j], pickles[i] })
+	}
+
+	for i, p := range pickles {
+		pickle := *p
+
+		queue <- i // reserve space in queue
+
+		runPickle := func(fail *bool, pickle *messages.Pickle) {
+			defer func() {
+				<-queue // free a space in queue
+			}()
+
+			if r.stopOnFailure && *fail {
+				return
 			}
-		} else {
-			copy(pickles, ft.Pickles)
+
+			// Copy base suite.
+			suite := *testSuiteContext.suite
+
+			if r.scenarioInitializer != nil {
+				sc := ScenarioContext{suite: &suite}
+				r.scenarioInitializer(&sc)
+			}
+
+			err := suite.runPickle(pickle)
+			if suite.shouldFail(err) {
+				copyLock.Lock()
+				*fail = true
+				copyLock.Unlock()
+			}
 		}
 
-		for i, p := range pickles {
-			pickle := *p
-
-			queue <- i // reserve space in queue
-
-			if i == 0 {
-				r.fmt.Feature(ft.GherkinDocument, ft.Uri, ft.Content)
-			}
-
-			runPickle := func(fail *bool, pickle *messages.Pickle) {
-				defer func() {
-					<-queue // free a space in queue
-				}()
-
-				if r.stopOnFailure && *fail {
-					return
-				}
-
-				// Copy base suite.
-				suite := *testSuiteContext.suite
-
-				if r.scenarioInitializer != nil {
-					sc := ScenarioContext{suite: &suite}
-					r.scenarioInitializer(&sc)
-				}
-
-				err := suite.runPickle(pickle)
-				if suite.shouldFail(err) {
-					copyLock.Lock()
-					*fail = true
-					copyLock.Unlock()
-				}
-			}
-
-			if rate == 1 {
-				// Running within the same goroutine for concurrency 1
-				// to preserve original stacks and simplify debugging.
-				runPickle(&failed, &pickle)
-			} else {
-				go runPickle(&failed, &pickle)
-			}
+		if rate == 1 {
+			// Running within the same goroutine for concurrency 1
+			// to preserve original stacks and simplify debugging.
+			runPickle(&failed, &pickle)
+		} else {
+			go runPickle(&failed, &pickle)
 		}
 	}
 
